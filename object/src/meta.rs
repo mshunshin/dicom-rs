@@ -952,41 +952,41 @@ impl HasLength for FileMetaAttribute<'_> {
         match Tag(0x0002, self.tag_e) {
             tags::FILE_META_INFORMATION_GROUP_LENGTH => Length(4),
             tags::MEDIA_STORAGE_SOP_CLASS_UID => {
-                Length(self.meta.media_storage_sop_class_uid.len() as u32)
+                Length(encoded_len(&self.meta.media_storage_sop_class_uid) as u32)
             }
             tags::MEDIA_STORAGE_SOP_INSTANCE_UID => {
-                Length(self.meta.media_storage_sop_instance_uid.len() as u32)
+                Length(encoded_len(&self.meta.media_storage_sop_instance_uid) as u32)
             }
             tags::IMPLEMENTATION_CLASS_UID => {
-                Length(self.meta.implementation_class_uid.len() as u32)
+                Length(encoded_len(&self.meta.implementation_class_uid) as u32)
             }
             tags::IMPLEMENTATION_VERSION_NAME => Length(
                 self.meta
                     .implementation_version_name
                     .as_ref()
-                    .map(|s| s.len() as u32)
+                    .map(|s| encoded_len(s) as u32)
                     .unwrap_or(0),
             ),
             tags::SOURCE_APPLICATION_ENTITY_TITLE => Length(
                 self.meta
                     .source_application_entity_title
                     .as_ref()
-                    .map(|s| s.len() as u32)
+                    .map(|s| encoded_len(s) as u32)
                     .unwrap_or(0),
             ),
             tags::SENDING_APPLICATION_ENTITY_TITLE => Length(
                 self.meta
                     .sending_application_entity_title
                     .as_ref()
-                    .map(|s| s.len() as u32)
+                    .map(|s| encoded_len(s) as u32)
                     .unwrap_or(0),
             ),
-            tags::TRANSFER_SYNTAX_UID => Length(self.meta.transfer_syntax.len() as u32),
+            tags::TRANSFER_SYNTAX_UID => Length(encoded_len(&self.meta.transfer_syntax) as u32),
             tags::PRIVATE_INFORMATION_CREATOR_UID => Length(
                 self.meta
                     .private_information_creator_uid
                     .as_ref()
-                    .map(|s| s.len() as u32)
+                    .map(|s| encoded_len(s) as u32)
                     .unwrap_or(0),
             ),
             _ => unreachable!(),
@@ -1309,15 +1309,26 @@ pub struct FileMetaTableBuilder {
     private_information: Option<Vec<u8>>,
 }
 
-/// Ensure that the string is even lengthed, by adding a trailing character
-/// if not.
+/// The number of bytes that the text value `s` occupies once written.
+///
+/// File meta text is encoded with the default character set,
+/// one byte per character,
+/// so this is not the length of the string in UTF-8
+/// once it holds a character beyond ASCII.
+#[inline]
+fn encoded_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Ensure that the string is even lengthed once encoded,
+/// by adding a trailing character if not.
 #[inline]
 fn padded<T>(s: T, pad: char) -> String
 where
     T: Into<String>,
 {
     let mut s = s.into();
-    if s.len() % 2 == 1 {
+    if encoded_len(&s) % 2 == 1 {
         s.push(pad);
     }
     s
@@ -1497,7 +1508,7 @@ impl FileMetaTableBuilder {
 }
 
 fn dicom_len<T: AsRef<str>>(x: T) -> u32 {
-    (x.as_ref().len() as u32 + 1) & !1
+    (encoded_len(x.as_ref()) as u32 + 1) & !1
 }
 
 #[cfg(test)]
@@ -1944,6 +1955,57 @@ mod tests {
             table.information_group_length,
             table2.information_group_length
         );
+    }
+
+    /// Text beyond ASCII is written one byte per character,
+    /// so it is padded and its length counted by characters, not UTF-8 bytes:
+    /// a table with such text writes, reads back the same,
+    /// and writes back the same bytes.
+    #[test]
+    fn non_ascii_text_round_trips() {
+        use crate::DicomObject as _;
+        use dicom_core::Length;
+        use dicom_core::header::HasLength;
+
+        let table = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.7")
+            .media_storage_sop_instance_uid("1.2.3.4.5")
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .implementation_class_uid("1.2.345.6.7890.1.234")
+            // 8 characters, 9 bytes as UTF-8
+            .implementation_version_name("CAF\u{c9} 1.0")
+            // 4 characters, 5 bytes as UTF-8
+            .source_application_entity_title("\u{c9}CHO")
+            .build()
+            .unwrap();
+
+        // even already: nothing added
+        assert_eq!(
+            table.implementation_version_name.as_deref(),
+            Some("CAF\u{c9} 1.0")
+        );
+        assert_eq!(
+            table.source_application_entity_title.as_deref(),
+            Some("\u{c9}CHO")
+        );
+        assert_eq!(
+            table
+                .attr(tags::IMPLEMENTATION_VERSION_NAME)
+                .unwrap()
+                .length(),
+            Length(8)
+        );
+
+        let mut buf = b"DICM".to_vec();
+        table.write(&mut buf).unwrap();
+        // the group length counts the bytes after its own element
+        assert_eq!(table.information_group_length as usize, buf.len() - 4 - 12);
+
+        let table2 = FileMetaTable::from_reader(&mut buf.as_slice()).unwrap();
+        assert_eq!(table2, table);
+        let mut buf2 = b"DICM".to_vec();
+        table2.write(&mut buf2).unwrap();
+        assert_eq!(buf2, buf);
     }
 
     /// Can access file meta properties via the DicomObject trait
